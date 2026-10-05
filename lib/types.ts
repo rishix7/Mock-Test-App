@@ -4,7 +4,9 @@ export type TestQuestion = {
   choices: string[];
   correctAnswer: number;
   category: string;
-  timeLimitSeconds: number;
+  /** Kept optional for tests created by earlier app versions. */
+  timeLimitSeconds?: number;
+  reviewNotes?: string[];
 };
 
 export type TestDefinition = {
@@ -12,6 +14,7 @@ export type TestDefinition = {
   description: string;
   questions: TestQuestion[];
   demo?: boolean;
+  published?: boolean;
 };
 
 export type AnswerRecord = {
@@ -33,4 +36,12 @@ export type Attempt = {
   score: number;
   totalQuestions: number;
   completedAt: string;
+  userId: string;
+  durationSeconds: number;
+};
+
+export type TestStats = {
+  attemptCount: number;
+  totalDurationSeconds: number;
+  questions: Record<string, { count: number; totalTimeSeconds: number }>;
 };
