@@ -9,6 +9,22 @@ service cloud.firestore {
         && request.resource.data.questions is list
         && request.resource.data.questions.size() > 0;
       allow update, delete: if false;
+
+      // Small, compressed diagrams are separate documents so loading the test
+      // list does not download every image. They are created atomically with
+      // their parent test and are immutable after publishing.
+      match /diagrams/{diagramId} {
+        allow read: if true;
+        allow create: if request.resource.data.keys().hasOnly(['dataUrl', 'contentType', 'byteSize'])
+          && request.resource.data.dataUrl is string
+          && request.resource.data.dataUrl.size() <= 900000
+          && request.resource.data.contentType in ['image/webp', 'image/jpeg', 'image/png']
+          && request.resource.data.byteSize is int
+          && request.resource.data.byteSize > 0
+          && request.resource.data.byteSize <= 614400
+          && getAfter(/databases/$(database)/documents/tests/$(testId)).data.published == true;
+        allow update, delete: if false;
+      }
     }
 
     // Attempts can only be created/read by their signed-in owner. Aggregates are

@@ -7,6 +7,13 @@ export type TestQuestion = {
   /** Kept optional for tests created by earlier app versions. */
   timeLimitSeconds?: number;
   reviewNotes?: string[];
+  /** 0-based source-image index while a draft is being reviewed. */
+  questionImageIndex?: number;
+  /** One 0-based source-image index per choice; -1 means no diagram. */
+  choiceImageIndexes?: number[];
+  /** Firestore subcollection document IDs after the test is published. */
+  diagramId?: string;
+  choiceDiagramIds?: Array<string | null>;
 };
 
 export type TestDefinition = {
@@ -15,6 +22,7 @@ export type TestDefinition = {
   questions: TestQuestion[];
   demo?: boolean;
   published?: boolean;
+  diagramIds?: string[];
 };
 
 export type AnswerRecord = {
