@@ -12,7 +12,6 @@ const demoTest: TestDefinition = { name: "JavaScript Basics", description: "A sh
   { id: "demo-1", question: "Which keyword creates a block-scoped variable?", choices: ["var", "let", "define", "static"], correctAnswer: 1, category: "Variables" },
   { id: "demo-2", question: "Which method converts JSON text into a JavaScript value?", choices: ["JSON.stringify()", "JSON.parse()", "Object.fromJSON()", "parse.JSON()"], correctAnswer: 1, category: "JSON" },
 ] };
-const promptText = `Create a multiple-choice test as valid JSON only, no markdown. Use this shape: {"name":"Test name","description":"Short description","questions":[{"id":"q1","question":"Question text","choices":["A","B","C","D"],"correctAnswer":0,"category":"Topic","reviewNotes":[]}]}. correctAnswer is a zero-based choice index. Use only source-supported facts; put uncertainty in reviewNotes.`;
 const MAX_FILES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
@@ -25,7 +24,7 @@ function validateTest(value: unknown): TestDefinition {
   const questions = test.questions.map((raw, index) => {
     const q = raw as Partial<TestQuestion>;
     if (typeof q.question !== "string" || !q.question.trim()) throw new Error(`Question ${index + 1}: add question text.`);
-    if (!Array.isArray(q.choices) || q.choices.length < 2 || q.choices.some(c => typeof c !== "string" || !c.trim())) throw new Error(`Question ${index + 1}: add at least two non-empty choices.`);
+    if (!Array.isArray(q.choices) || q.choices.length !== 4 || q.choices.some(c => typeof c !== "string" || !c.trim())) throw new Error(`Question ${index + 1}: add four non-empty choices.`);
     if (!Number.isInteger(q.correctAnswer) || (q.correctAnswer as number) < 0 || (q.correctAnswer as number) >= q.choices.length) throw new Error(`Question ${index + 1}: choose a correct answer.`);
     if (typeof q.category !== "string" || !q.category.trim()) throw new Error(`Question ${index + 1}: add a category.`);
     return { id: q.id?.trim() || `q${index + 1}`, question: q.question.trim(), choices: q.choices.map(c => c.trim()), correctAnswer: q.correctAnswer as number, category: q.category.trim(), reviewNotes: Array.isArray(q.reviewNotes) ? q.reviewNotes.filter((n): n is string => typeof n === "string") : [] };
@@ -40,9 +39,6 @@ function formatDuration(seconds: number) {
 
 export default function Home() {
   const [screen, setScreen] = useState<Screen>("home");
-  const [testName, setTestName] = useState("");
-  const [description, setDescription] = useState("");
-  const [json, setJson] = useState("");
   const [draft, setDraft] = useState<TestDefinition | null>(null);
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [tests, setTests] = useState<SavedTest[]>([]);
@@ -112,12 +108,7 @@ export default function Home() {
   }, [screen]);
 
   function clearError() { setError(""); }
-  function beginCreate() { setTestName(""); setDescription(""); setJson(""); setGenerationPrompt(""); setDraft(null); setSourceFiles([]); clearError(); setScreen("create"); }
-  function preview(event: FormEvent) {
-    event.preventDefault(); clearError();
-    try { const parsed = validateTest(JSON.parse(json)); setDraft({ ...parsed, name: testName.trim() || parsed.name, description: description.trim() || parsed.description }); setReviewConfirmed(false); setScreen("preview"); }
-    catch (e) { setError(e instanceof Error ? e.message : "Please check the JSON."); }
-  }
+  function beginCreate() { setGenerationPrompt(""); setDraft(null); setSourceFiles([]); clearError(); setScreen("create"); }
   function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
     const total = files.reduce((sum, file) => sum + file.size, 0);
@@ -139,7 +130,7 @@ export default function Home() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "AI generation failed.");
       const parsed = validateTest(payload);
-      setDraft(parsed); setReviewConfirmed(false); setTestName(parsed.name); setDescription(parsed.description); setSourceFiles([]); setScreen("preview");
+      setDraft(parsed); setReviewConfirmed(false); setSourceFiles([]); setScreen("preview");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not reach the AI generation API.");
     } finally { setGenerationBusy(false); }
@@ -226,14 +217,14 @@ export default function Home() {
   return <main className="app-shell">
     <header className="topbar"><button className="brand" disabled={screen === "quiz"} onClick={() => { setScreen("home"); clearError(); }} aria-label="Go home"><span className="brand-mark">m</span>minute</button><span className="top-note">A little practice, one question at a time.</span>{authReady && user && <button className="text-button" onClick={() => firebaseAuth && void signOut(firebaseAuth)}>Sign out</button>}</header>
     {error && <div className="toast" role="alert">{error}<button onClick={clearError} aria-label="Dismiss">×</button></div>}
-    {screen === "home" && <section className="hero"><div className="eyebrow"><span className="live-dot"/> YOUR FOCUS, MEASURED</div><h1>Make every<br/><em>minute</em> count.</h1><p className="hero-copy">Create tests from study material, or take a focused practice test.</p><div className="home-actions"><button className="action-card primary-card" onClick={beginCreate}><span className="action-icon">＋</span><span><strong>Create a test</strong><small>Upload source material or paste test JSON</small></span><span className="arrow">↗</span></button><button className="action-card" onClick={() => { clearError(); setScreen("attend"); }}><span className="action-icon secondary-icon">◷</span><span><strong>Take a test</strong><small>{tests.length ? `${tests.length} ready to explore` : "Find something to learn"}</small></span><span className="arrow">↗</span></button></div>{!user && <button className="text-button" onClick={() => setScreen("auth")}>Participant sign in / create account</button>}<div className="hero-foot"><span>✳ &nbsp;Made for curious minds</span><span>01 — START HERE</span></div></section>}
+    {screen === "home" && <section className="hero"><div className="eyebrow"><span className="live-dot"/> YOUR FOCUS, MEASURED</div><h1>Make every<br/><em>minute</em> count.</h1><p className="hero-copy">Create tests from study material, or take a focused practice test.</p><div className="home-actions"><button className="action-card primary-card" onClick={beginCreate}><span className="action-icon">＋</span><span><strong>Create a test</strong><small>Upload source material and generate a test</small></span><span className="arrow">↗</span></button><button className="action-card" onClick={() => { clearError(); setScreen("attend"); }}><span className="action-icon secondary-icon">◷</span><span><strong>Take a test</strong><small>{tests.length ? `${tests.length} ready to explore` : "Find something to learn"}</small></span><span className="arrow">↗</span></button></div>{!user && <button className="text-button" onClick={() => setScreen("auth")}>Participant sign in / create account</button>}<div className="hero-foot"><span>✳ &nbsp;Made for curious minds</span><span>01 — START HERE</span></div></section>}
 
     {screen === "auth" && <section className="panel"><button className="back" onClick={() => setScreen("attend")}>← Tests</button><div className="eyebrow">PARTICIPANT ACCOUNT</div><h1>{authMode === "signin" ? <>Welcome<br/><em>back.</em></> : <>Join the<br/><em>practice.</em></>}</h1><p className="muted">Sign in to take tests and keep your individual results private to your account.</p><form className="form-stack" onSubmit={authenticate}><label>Email<input type="email" required autoComplete="email" value={email} onChange={e => setEmail(e.target.value)}/></label><label>Password<input type="password" required minLength={6} autoComplete={authMode === "signin" ? "current-password" : "new-password"} value={password} onChange={e => setPassword(e.target.value)}/></label><button className="button dark-button" disabled={busy}>{busy ? "Please wait…" : authMode === "signin" ? "Sign in" : "Create account"}<span>→</span></button></form><button className="text-button" onClick={() => setAuthMode(authMode === "signin" ? "register" : "signin")}>{authMode === "signin" ? "New participant? Create an account" : "Already registered? Sign in"}</button></section>}
 
     {screen === "create" && <section className="panel">
       <button className="back" onClick={() => setScreen("home")}>← Home</button>
       <div className="eyebrow">01 / CREATE</div><h1>Build your<br/><em>own test.</em></h1>
-      <p className="muted">Describe the test you want and upload up to 3 clear images (15 MB total). The AI checks that the images match your prompt before it generates JSON.</p>
+      <p className="muted">Describe the test you want and upload up to 3 clear images (15 MB total). The AI checks that the images match your prompt, then creates an editable test draft.</p>
       <div className="form-stack source-generator">
         <label>Test instructions / topic<textarea value={generationPrompt} onChange={e => setGenerationPrompt(e.target.value)} placeholder="Example: Make a 10-question test about the water cycle shown in this diagram. Use medium difficulty and focus on evaporation and condensation." rows={4}/></label>
         <label>Source image(s)<input type="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" multiple onChange={handleFiles}/></label>
@@ -242,11 +233,9 @@ export default function Home() {
           <label>Question count<input type="number" min="1" max="10" value={questionCount} onChange={e => setQuestionCount(Math.min(10, Math.max(1, Number(e.target.value))))}/></label>
           <label>Difficulty<select value={difficulty} onChange={e => setDifficulty(e.target.value)}><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         </div>
-        <button className="button dark-button" type="button" onClick={generateFromFiles} disabled={generationBusy}>{generationBusy ? "Checking image & generating…" : "Check image & generate JSON"}<span>→</span></button>
+        <button className="button dark-button" type="button" onClick={generateFromFiles} disabled={generationBusy}>{generationBusy ? "Checking image & creating test…" : "Check image & create test"}<span>→</span></button>
         <div className="setup-note"><strong>Hosted open-weight AI</strong><br/>The image is checked first. If it is blank, unrelated, or unreadable, generation stops and asks for a better image. Approved images and prompt are sent securely to the API; review the generated questions before publishing. API key is stored on the backend.</div>
       </div>
-      <div className="prompt-row"><span>Already have generated JSON?</span><button type="button" className="text-button" onClick={() => navigator.clipboard.writeText(promptText).then(() => setError("Prompt copied. Generate JSON with your preferred tool."))}>Copy JSON prompt ↗</button></div>
-      <form onSubmit={preview} className="form-stack manual-form"><label>Test name<input value={testName} onChange={e => setTestName(e.target.value)} placeholder="e.g. Biology chapter 1"/></label><label>Short description<input value={description} onChange={e => setDescription(e.target.value)} placeholder="What will this test cover?"/></label><label>Test JSON<textarea value={json} onChange={e => setJson(e.target.value)} placeholder={'{\n  "name": "My test",\n  "questions": [...]\n}'} rows={8}/></label><button className="button dark-button" type="submit">Review JSON <span>→</span></button></form>
     </section>}
 
     {screen === "preview" && draft && <section className="panel wide-panel"><button className="back" onClick={() => setScreen("create")}>← Back to creator</button><div className="eyebrow">02 / REQUIRED REVIEW</div><h1>Review &<br/><em>approve.</em></h1><p className="muted">Edit the title, questions, options, answer key, and categories. Nothing is published until you approve it below.</p><label className="edit-field">Test title<input value={draft.name} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, name: e.target.value }); }}/></label><label className="edit-field">Description<input value={draft.description} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, description: e.target.value }); }}/></label><div className="question-list">{draft.questions.map((q, i) => <article className="question-preview" key={q.id}><div className="question-meta"><span>QUESTION {String(i + 1).padStart(2, "0")}</span><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: draft.questions.filter((_, idx) => idx !== i) }); }}>Remove</button></div>{q.reviewNotes?.length ? <div className="review-warning"><strong>Needs source check</strong><ul>{q.reviewNotes.map((note, ni) => <li key={ni}>{note}</li>)}</ul></div> : null}<label className="edit-field">Question<input value={q.question} onChange={e => updateQuestion(i, { question: e.target.value })}/></label><div className="choice-edit-list">{q.choices.map((c, ci) => <label className="choice-edit" key={ci}><input type="radio" name={`correct-${i}`} checked={q.correctAnswer === ci} aria-label={`Mark choice ${ci + 1} correct`} onChange={() => updateQuestion(i, { correctAnswer: ci })}/><input value={c} aria-label={`Choice ${ci + 1}`} onChange={e => updateQuestion(i, { choices: q.choices.map((option, oi) => oi === ci ? e.target.value : option) })}/><span>Correct</span></label>)}</div><div className="edit-grid"><label>Category<input value={q.category} onChange={e => updateQuestion(i, { category: e.target.value })}/></label></div></article>)}</div><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: [...draft.questions, { id: `q-${Date.now()}`, question: "", choices: ["", "", "", ""], correctAnswer: 0, category: "General" }] }); }}>＋ Add question</button><label className="review-confirm"><input type="checkbox" checked={reviewConfirmed} onChange={e => setReviewConfirmed(e.target.checked)}/> I reviewed the test questions, choices, and answer key.</label><button className="button dark-button publish-button" onClick={saveTest} disabled={busy || !draft.questions.length || !reviewConfirmed}>{busy ? "Publishing…" : "Approve & publish test"}<span>→</span></button></section>}

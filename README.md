@@ -1,6 +1,6 @@
 # Minute — source-based test MVP
 
-Minute is a Next.js static frontend backed by Firebase Authentication and Firestore. Creators can publish tests from reviewed JSON or generate them from a prompt plus image using a hosted vision model. Participant attempts are private to the signed-in account; a trusted Firebase Function writes anonymous timing aggregates.
+Minute is a Next.js static frontend backed by Firebase Authentication and Firestore. Creators can generate test drafts from a prompt and images, edit the generated questions and answers, and publish approved tests. Participant attempts are private to the signed-in account; a Firebase Function writes anonymized timing aggregates.
 
 ## Run the app
 
@@ -13,14 +13,12 @@ The Attend screen and sample test can be explored without Firebase, but particip
 
 ## Image + prompt question generation
 
-The creator enters instructions, question count, and difficulty, then uploads up to 3 PNG/JPEG/WebP images (8 MB each, 15 MB total). A Firebase HTTPS Function first asks the vision model whether every image is readable and relevant. If not, generation stops and the UI asks for a better image. If accepted, a second model request generates a validated multiple-choice JSON draft. The creator must review it before publishing. Uploaded images are sent in memory for inference and are not stored in Firebase.
+The creator enters instructions, question count, and difficulty, then uploads up to 3 PNG/JPEG/WebP images (8 MB each, 15 MB total). The Firebase HTTPS Function sends the images and prompt to NVIDIA NIM's `moonshotai/kimi-k3` vision model. The model first assesses whether every image is readable and relevant; unsuitable images are rejected with a helpful message. For accepted images, it generates a multiple-choice JSON draft. The backend validates the result and sends the structured test to the existing editable review screen. Raw JSON is not shown in the UI, and uploaded images are processed in memory rather than stored in Firebase.
 
-The integration uses Groq's free-tier API with `qwen/qwen3.8-27b`, a hosted vision-capable open-weight model with JSON mode. Groq's current limits include a maximum of 3 images per request and account/model-specific rate limits; the provider can change its free tier. See [Groq image/JSON input docs](https://console.groq.com/docs/vision) and [rate limits](https://console.groq.com/docs/rate-limits).
-
-The API key is never sent to the browser. After obtaining a Groq API key, store it as a Firebase secret (do not put it in `.env.local` or commit it):
+The NVIDIA API key is server-only. Never put it in `.env.local`, frontend code, Git, or chat. Store a newly created/rotated key as a Firebase secret:
 
 ```powershell
-firebase functions:secrets:set GROQ_API_KEY
+firebase functions:secrets:set NVIDIA_API_KEY
 ```
 
 Deploy the generator and Hosting rewrite with Firebase CLI:
@@ -29,9 +27,9 @@ Deploy the generator and Hosting rewrite with Firebase CLI:
 firebase deploy --only functions:generateTest,hosting
 ```
 
-**Billing note:** Groq inference has free-tier limits, but deploying Cloud Functions requires Firebase's Blaze plan and a linked billing account. Firebase's Functions usage may have no-cost quotas, but deployment/storage and usage are not guaranteed to cost exactly zero. Do not deploy until the project owner approves linking billing. The project code is implemented; no API secret has been set and no function has been deployed from this workspace.
+NVIDIA offers a free API tier subject to provider limits and availability; the provider may change those terms. The app applies a best-effort maximum of 5 generations per IP per hour, but this is not a guaranteed billing cap. There is no paid fallback. Model output can be wrong, so the creator must review and edit the draft before publishing.
 
-The free inference API is rate-limited (the app also enforces a best-effort maximum of 5 generations per IP per hour). On quota exhaustion, generation stops with an error; there is no paid fallback. Model output may still be wrong, so human review remains required.
+**Billing note:** Deploying Cloud Functions requires Firebase's Blaze plan and a linked billing account, even if the inference API is free. Firebase Functions usage is not guaranteed to cost exactly zero. Do not deploy until the project owner approves linking billing. No API secret has been set and no function has been deployed from this workspace.
 
 ## Firebase setup and deployment
 
