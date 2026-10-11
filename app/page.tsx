@@ -2,7 +2,7 @@
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, signOut, User } from "firebase/auth";
-import { addDoc, collection, doc, getDoc, getDocs, orderBy, query, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, doc, getDoc, getDocs, orderBy, query, serverTimestamp, writeBatch } from "firebase/firestore";
 import { db, firebaseAuth } from "@/lib/firebase";
 import type { AnswerRecord, Attempt, TestDefinition, TestQuestion, TestStats } from "@/lib/types";
 
@@ -15,6 +15,48 @@ const demoTest: TestDefinition = { name: "JavaScript Basics", description: "A sh
 const MAX_FILES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
+const MAX_STORED_DIAGRAM_BYTES = 600 * 1024;
+
+function resizeDiagram(file: File): Promise<{ dataUrl: string; contentType: string; byteSize: number }> {
+  return new Promise((resolve, reject) => {
+    createImageBitmap(file).then(async bitmap => {
+      const longestSide = Math.max(bitmap.width, bitmap.height);
+      const attempts = [
+        { maxSide: 1800, quality: 0.86 },
+        { maxSide: 1500, quality: 0.78 },
+        { maxSide: 1200, quality: 0.7 },
+        { maxSide: 1000, quality: 0.62 },
+      ];
+      try {
+        for (const attempt of attempts) {
+          const scale = Math.min(1, attempt.maxSide / longestSide);
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+          canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("Your browser could not prepare the diagram image.");
+          context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          const blob = await new Promise<Blob | null>(done => canvas.toBlob(done, "image/webp", attempt.quality));
+          if (!blob) continue;
+          if (blob.size <= MAX_STORED_DIAGRAM_BYTES) {
+            const dataUrl = await new Promise<string>((done, fail) => {
+              const reader = new FileReader();
+              reader.onload = () => typeof reader.result === "string" ? done(reader.result) : fail(new Error("Could not encode diagram."));
+              reader.onerror = () => fail(new Error("Could not encode diagram."));
+              reader.readAsDataURL(blob);
+            });
+            return resolve({ dataUrl, contentType: blob.type || "image/webp", byteSize: blob.size });
+          }
+        }
+        reject(new Error(`${file.name} is still too large after compression. Use a smaller image or crop it before uploading (maximum 600 KB per saved diagram).`));
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error("Could not prepare a diagram image."));
+      } finally {
+        bitmap.close();
+      }
+    }).catch(() => reject(new Error(`Could not read ${file.name}. Try a PNG, JPEG, or WebP image.`)));
+  });
+}
 
 function validateTest(value: unknown): TestDefinition {
   if (!value || typeof value !== "object") throw new Error("The test must be an object.");
@@ -27,7 +69,16 @@ function validateTest(value: unknown): TestDefinition {
     if (!Array.isArray(q.choices) || q.choices.length !== 4 || q.choices.some(c => typeof c !== "string" || !c.trim())) throw new Error(`Question ${index + 1}: add four non-empty choices.`);
     if (!Number.isInteger(q.correctAnswer) || (q.correctAnswer as number) < 0 || (q.correctAnswer as number) >= q.choices.length) throw new Error(`Question ${index + 1}: choose a correct answer.`);
     if (typeof q.category !== "string" || !q.category.trim()) throw new Error(`Question ${index + 1}: add a category.`);
-    return { id: q.id?.trim() || `q${index + 1}`, question: q.question.trim(), choices: q.choices.map(c => c.trim()), correctAnswer: q.correctAnswer as number, category: q.category.trim(), reviewNotes: Array.isArray(q.reviewNotes) ? q.reviewNotes.filter((n): n is string => typeof n === "string") : [] };
+    const questionImageIndex = Number.isInteger(q.questionImageIndex) ? q.questionImageIndex as number : -1;
+    const choiceImageIndexes = Array.isArray(q.choiceImageIndexes) && q.choiceImageIndexes.length === 4
+      ? q.choiceImageIndexes.map(index => Number.isInteger(index) ? index : -1)
+      : [-1, -1, -1, -1];
+    return {
+      id: q.id?.trim() || `q${index + 1}`,
+      question: q.question.trim(), choices: q.choices.map(c => c.trim()), correctAnswer: q.correctAnswer as number,
+      category: q.category.trim(), reviewNotes: Array.isArray(q.reviewNotes) ? q.reviewNotes.filter((n): n is string => typeof n === "string") : [],
+      questionImageIndex, choiceImageIndexes,
+    };
   });
   return { name: test.name.trim(), description: typeof test.description === "string" ? test.description.trim() : "", questions };
 }
@@ -52,6 +103,8 @@ export default function Home() {
   const [questionCount, setQuestionCount] = useState(10);
   const [difficulty, setDifficulty] = useState("medium");
   const [sourceFiles, setSourceFiles] = useState<File[]>([]);
+  const [sourcePreviewUrls, setSourcePreviewUrls] = useState<string[]>([]);
+  const [selectedDiagrams, setSelectedDiagrams] = useState<Record<string, string>>({});
   const [generationPrompt, setGenerationPrompt] = useState("");
   const [generationBusy, setGenerationBusy] = useState(false);
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -80,6 +133,11 @@ export default function Home() {
     if (!firebaseAuth) { setAuthReady(true); return; }
     return onAuthStateChanged(firebaseAuth, current => { setUser(current); setAuthReady(true); });
   }, []);
+  useEffect(() => {
+    const urls = sourceFiles.map(file => URL.createObjectURL(file));
+    setSourcePreviewUrls(urls);
+    return () => urls.forEach(url => URL.revokeObjectURL(url));
+  }, [sourceFiles]);
   useEffect(() => {
     if (!db) return;
     getDocs(query(collection(db, "tests"), orderBy("createdAt", "desc"))).then(snapshot => {
@@ -126,11 +184,12 @@ export default function Home() {
     try {
       const body = new FormData(); sourceFiles.forEach(file => body.append("images", file));
       body.set("prompt", generationPrompt.trim()); body.set("questionCount", String(questionCount)); body.set("difficulty", difficulty);
-      const response = await fetch("/api/generate-test", { method: "POST", body });
+      const generatorUrl = process.env.NEXT_PUBLIC_TEST_GENERATOR_URL || "/api/generate-test";
+      const response = await fetch(generatorUrl, { method: "POST", body });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "AI generation failed.");
       const parsed = validateTest(payload);
-      setDraft(parsed); setReviewConfirmed(false); setSourceFiles([]); setScreen("preview");
+      setDraft(parsed); setReviewConfirmed(false); setScreen("preview");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not reach the AI generation API.");
     } finally { setGenerationBusy(false); }
@@ -142,10 +201,45 @@ export default function Home() {
     setBusy(true); clearError();
     try {
       const { id: _id, demo: _demo, ...data } = draft as TestDefinition & { id?: string; demo?: boolean };
-      const published = { ...data, published: true, createdAt: serverTimestamp() };
-      const ref = await addDoc(collection(db, "tests"), published);
-      setTests(existing => [{ ...data, published: true, id: ref.id }, ...existing]); setScreen("attend");
-    } catch { setError("Could not publish this test. Apply firestore.rules and check Firebase setup."); }
+      const usedImageIndexes = new Set<number>();
+      for (const question of data.questions) {
+        const questionImageIndex = question.questionImageIndex ?? -1;
+        const choiceImageIndexes = question.choiceImageIndexes ?? [-1, -1, -1, -1];
+        if (questionImageIndex >= sourceFiles.length || questionImageIndex < -1
+            || choiceImageIndexes.length !== 4
+            || choiceImageIndexes.some(index => index < -1 || index >= sourceFiles.length)) {
+          throw new Error("A question refers to an image that is no longer selected. Return to the creator and generate the draft again.");
+        }
+        if (questionImageIndex >= 0) usedImageIndexes.add(questionImageIndex);
+        choiceImageIndexes.forEach(index => { if (index >= 0) usedImageIndexes.add(index); });
+      }
+      const diagramIds = [...usedImageIndexes].sort((a, b) => a - b).map(index => `diagram-${index}`);
+      const compressedDiagrams = await Promise.all([...usedImageIndexes].sort((a, b) => a - b).map(async index => ({
+        id: `diagram-${index}`,
+        ...await resizeDiagram(sourceFiles[index]),
+      })));
+      const questions = data.questions.map(question => {
+        const { questionImageIndex = -1, choiceImageIndexes = [-1, -1, -1, -1], ...textAndAnswer } = question;
+        return {
+          ...textAndAnswer,
+          ...(questionImageIndex >= 0 ? { diagramId: `diagram-${questionImageIndex}` } : {}),
+          choiceDiagramIds: choiceImageIndexes.map(index => index >= 0 ? `diagram-${index}` : null),
+        };
+      });
+      const testRef = doc(collection(db, "tests"));
+      const batch = writeBatch(db);
+      batch.set(testRef, { ...data, questions, diagramIds, published: true, createdAt: serverTimestamp() });
+      for (const diagram of compressedDiagrams) {
+        batch.set(doc(db, "tests", testRef.id, "diagrams", diagram.id), {
+          dataUrl: diagram.dataUrl,
+          contentType: diagram.contentType,
+          byteSize: diagram.byteSize,
+        });
+      }
+      await batch.commit();
+      const published: SavedTest = { ...data, questions, diagramIds, published: true, id: testRef.id };
+      setTests(existing => [published, ...existing]); setSourceFiles([]); setScreen("attend");
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not publish this test. Apply firestore.rules and check Firebase setup."); }
     finally { setBusy(false); }
   }
   async function authenticate(event: FormEvent) {
@@ -159,8 +253,31 @@ export default function Home() {
     } catch (e) { setError(e instanceof Error ? e.message.replace("Firebase:", "") : "Could not sign in."); }
     finally { setBusy(false); }
   }
-  function startTest(test: SavedTest) {
+  async function startTest(test: SavedTest) {
     if (!user) { setError("Sign in with email and password before starting a test."); setScreen("auth"); return; }
+    clearError();
+    setBusy(true);
+    try {
+      const diagramIds = [...new Set([
+        ...(test.diagramIds || []),
+        ...test.questions.flatMap(question => [question.diagramId, ...(question.choiceDiagramIds || [])].filter((id): id is string => Boolean(id))),
+      ])];
+      const diagrams: Record<string, string> = {};
+      if (db && !test.demo && diagramIds.length) {
+        const snapshot = await getDocs(collection(db, "tests", test.id, "diagrams"));
+        snapshot.docs.forEach(item => {
+          const data = item.data();
+          if (diagramIds.includes(item.id) && typeof data.dataUrl === "string") diagrams[item.id] = data.dataUrl;
+        });
+        if (diagramIds.some(id => !diagrams[id])) throw new Error("A diagram for this test could not be loaded. Check Firestore rules and retry.");
+      }
+      setSelectedDiagrams(diagrams);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load the test diagrams.");
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
     setSelected(test); setQuestionIndex(0); setElapsedSeconds(0); questionPausedMs.current = 0; totalPausedMs.current = 0;
     questionStartedAt.current = Date.now(); totalStartedAt.current = Date.now(); pausedRef.current = false;
     setAnswers([]); setChoice(null); setPaused(false); setFocusMessage("Elapsed time counts only while your test is active."); clearError(); setScreen("quiz");
@@ -213,6 +330,16 @@ export default function Home() {
     setReviewConfirmed(false);
     setDraft({ ...draft, questions: draft.questions.map((question, i) => i === index ? { ...question, ...update } : question) });
   }
+  function setQuestionImage(index: number, imageIndex: number) {
+    updateQuestion(index, { questionImageIndex: imageIndex });
+  }
+  function setChoiceImage(questionIndex: number, choiceIndex: number, imageIndex: number) {
+    const question = draft?.questions[questionIndex];
+    if (!question) return;
+    const choiceImageIndexes = [...(question.choiceImageIndexes || [-1, -1, -1, -1])];
+    choiceImageIndexes[choiceIndex] = imageIndex;
+    updateQuestion(questionIndex, { choiceImageIndexes });
+  }
 
   return <main className="app-shell">
     <header className="topbar"><button className="brand" disabled={screen === "quiz"} onClick={() => { setScreen("home"); clearError(); }} aria-label="Go home"><span className="brand-mark">m</span>minute</button><span className="top-note">A little practice, one question at a time.</span>{authReady && user && <button className="text-button" onClick={() => firebaseAuth && void signOut(firebaseAuth)}>Sign out</button>}</header>
@@ -238,11 +365,35 @@ export default function Home() {
       </div>
     </section>}
 
-    {screen === "preview" && draft && <section className="panel wide-panel"><button className="back" onClick={() => setScreen("create")}>← Back to creator</button><div className="eyebrow">02 / REQUIRED REVIEW</div><h1>Review &<br/><em>approve.</em></h1><p className="muted">Edit the title, questions, options, answer key, and categories. Nothing is published until you approve it below.</p><label className="edit-field">Test title<input value={draft.name} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, name: e.target.value }); }}/></label><label className="edit-field">Description<input value={draft.description} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, description: e.target.value }); }}/></label><div className="question-list">{draft.questions.map((q, i) => <article className="question-preview" key={q.id}><div className="question-meta"><span>QUESTION {String(i + 1).padStart(2, "0")}</span><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: draft.questions.filter((_, idx) => idx !== i) }); }}>Remove</button></div>{q.reviewNotes?.length ? <div className="review-warning"><strong>Needs source check</strong><ul>{q.reviewNotes.map((note, ni) => <li key={ni}>{note}</li>)}</ul></div> : null}<label className="edit-field">Question<input value={q.question} onChange={e => updateQuestion(i, { question: e.target.value })}/></label><div className="choice-edit-list">{q.choices.map((c, ci) => <label className="choice-edit" key={ci}><input type="radio" name={`correct-${i}`} checked={q.correctAnswer === ci} aria-label={`Mark choice ${ci + 1} correct`} onChange={() => updateQuestion(i, { correctAnswer: ci })}/><input value={c} aria-label={`Choice ${ci + 1}`} onChange={e => updateQuestion(i, { choices: q.choices.map((option, oi) => oi === ci ? e.target.value : option) })}/><span>Correct</span></label>)}</div><div className="edit-grid"><label>Category<input value={q.category} onChange={e => updateQuestion(i, { category: e.target.value })}/></label></div></article>)}</div><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: [...draft.questions, { id: `q-${Date.now()}`, question: "", choices: ["", "", "", ""], correctAnswer: 0, category: "General" }] }); }}>＋ Add question</button><label className="review-confirm"><input type="checkbox" checked={reviewConfirmed} onChange={e => setReviewConfirmed(e.target.checked)}/> I reviewed the test questions, choices, and answer key.</label><button className="button dark-button publish-button" onClick={saveTest} disabled={busy || !draft.questions.length || !reviewConfirmed}>{busy ? "Publishing…" : "Approve & publish test"}<span>→</span></button></section>}
+    {screen === "preview" && draft && <section className="panel wide-panel">
+      <button className="back" onClick={() => setScreen("create")}>← Back to creator</button>
+      <div className="eyebrow">02 / REQUIRED REVIEW</div><h1>Review &<br/><em>approve.</em></h1>
+      <p className="muted">Edit the title, questions, options, answer key, and diagram links. Nothing is published until you approve it below.</p>
+      <label className="edit-field">Test title<input value={draft.name} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, name: e.target.value }); }}/></label>
+      <label className="edit-field">Description<input value={draft.description} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, description: e.target.value }); }}/></label>
+      <div className="diagram-source-note">Select a source image for the question or any answer choice. Only images linked to a question are saved, compressed, in Firestore.</div>
+      <div className="question-list">{draft.questions.map((q, i) => <article className="question-preview" key={q.id}>
+        <div className="question-meta"><span>QUESTION {String(i + 1).padStart(2, "0")}</span><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: draft.questions.filter((_, idx) => idx !== i) }); }}>Remove</button></div>
+        {q.reviewNotes?.length ? <div className="review-warning"><strong>Needs source check</strong><ul>{q.reviewNotes.map((note, ni) => <li key={ni}>{note}</li>)}</ul></div> : null}
+        <label className="edit-field">Question<input value={q.question} onChange={e => updateQuestion(i, { question: e.target.value })}/></label>
+        <div className="diagram-association"><label>Question diagram<select value={q.questionImageIndex ?? -1} onChange={e => setQuestionImage(i, Number(e.target.value))}><option value={-1}>No diagram</option>{sourceFiles.map((file, imageIndex) => <option key={imageIndex} value={imageIndex}>{`Image ${imageIndex + 1}: ${file.name}`}</option>)}</select></label>{(q.questionImageIndex ?? -1) >= 0 && sourcePreviewUrls[q.questionImageIndex!] && <img className="diagram-preview" src={sourcePreviewUrls[q.questionImageIndex!]} alt={`Question ${i + 1} diagram preview`}/>}</div>
+        <div className="choice-edit-list">{q.choices.map((c, ci) => { const imageIndex = q.choiceImageIndexes?.[ci] ?? -1; return <div className="choice-edit" key={ci}>
+          <input type="radio" name={`correct-${i}`} checked={q.correctAnswer === ci} aria-label={`Mark choice ${ci + 1} correct`} onChange={() => updateQuestion(i, { correctAnswer: ci })}/>
+          <input value={c} aria-label={`Choice ${ci + 1}`} onChange={e => updateQuestion(i, { choices: q.choices.map((option, oi) => oi === ci ? e.target.value : option) })}/>
+          <span>Correct</span>
+          <select aria-label={`Diagram for choice ${ci + 1}`} value={imageIndex} onChange={e => setChoiceImage(i, ci, Number(e.target.value))}><option value={-1}>No choice diagram</option>{sourceFiles.map((file, sourceIndex) => <option key={sourceIndex} value={sourceIndex}>{`Image ${sourceIndex + 1}: ${file.name}`}</option>)}</select>
+          {imageIndex >= 0 && sourcePreviewUrls[imageIndex] && <img className="diagram-preview choice-diagram-preview" src={sourcePreviewUrls[imageIndex]} alt={`Choice ${ci + 1} diagram preview`}/>}
+        </div>; })}</div>
+        <div className="edit-grid"><label>Category<input value={q.category} onChange={e => updateQuestion(i, { category: e.target.value })}/></label></div>
+      </article>)}</div>
+      <button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: [...draft.questions, { id: `q-${Date.now()}`, question: "", choices: ["", "", "", ""], correctAnswer: 0, category: "General", questionImageIndex: -1, choiceImageIndexes: [-1, -1, -1, -1] }] }); }}>＋ Add question</button>
+      <label className="review-confirm"><input type="checkbox" checked={reviewConfirmed} onChange={e => setReviewConfirmed(e.target.checked)}/> I reviewed the test questions, choices, diagrams, and answer key.</label>
+      <button className="button dark-button publish-button" onClick={saveTest} disabled={busy || !draft.questions.length || !reviewConfirmed}>{busy ? "Preparing diagrams & publishing…" : "Approve & publish test"}<span>→</span></button>
+    </section>}
 
-    {screen === "attend" && <section className="panel"><button className="back" onClick={() => setScreen("home")}>← Home</button><div className="eyebrow">PICK YOUR NEXT CHALLENGE</div><h1>Ready when<br/><em>you are.</em></h1><p className="muted">Choose a test. Your score stays private to your account; anonymous averages are shown to everyone.</p>{user ? <p className="signed-in">Signed in as {user.email}</p> : <div className="setup-note"><strong>Sign-in required to attend</strong><br/>Create a participant account or sign in. Individual results are private to your account.<button className="text-button" onClick={() => setScreen("auth")}>Sign in / create account →</button></div>}<div className="test-list">{[...tests, { ...demoTest, id: "demo" }].map(test => <article className="test-item test-item-card" key={test.id}><div className="test-badge">✳</div><div className="test-info"><h3>{test.name}</h3><p>{test.questions.length} questions · {test.description || "A focused practice test"}</p></div><button aria-label={`Attend ${test.name}`} onClick={() => startTest(test)}>→</button><button aria-label={`Analytics for ${test.name}`} onClick={() => void openTestAnalytics(test)}>Stats</button></article>)}</div>{!firebaseReady && <div className="setup-note">Firebase is not configured. The sample test can be viewed, but sign-in, publishing, and saving results need Firebase.</div>}</section>}
+    {screen === "attend" && <section className="panel"><button className="back" onClick={() => setScreen("home")}>← Home</button><div className="eyebrow">PICK YOUR NEXT CHALLENGE</div><h1>Ready when<br/><em>you are.</em></h1><p className="muted">Choose a test. Your score stays private to your account; anonymous averages are shown to everyone.</p>{user ? <p className="signed-in">Signed in as {user.email}</p> : <div className="setup-note"><strong>Sign-in required to attend</strong><br/>Create a participant account or sign in. Individual results are private to your account.<button className="text-button" onClick={() => setScreen("auth")}>Sign in / create account →</button></div>}<div className="test-list">{[...tests, { ...demoTest, id: "demo" }].map(test => <article className="test-item test-item-card" key={test.id}><div className="test-badge">✳</div><div className="test-info"><h3>{test.name}</h3><p>{test.questions.length} questions · {test.description || "A focused practice test"}</p></div><button aria-label={`Attend ${test.name}`} onClick={() => void startTest(test)} disabled={busy}>{busy ? "…" : "→"}</button><button aria-label={`Analytics for ${test.name}`} onClick={() => void openTestAnalytics(test)}>Stats</button></article>)}</div>{!firebaseReady && <div className="setup-note">Firebase is not configured. The sample test can be viewed, but sign-in, publishing, and saving results need Firebase.</div>}</section>}
 
-    {screen === "quiz" && selected && currentQuestion && <section className="quiz-panel"><div className="quiz-top"><div><div className="eyebrow">{selected.name.toUpperCase()}</div><span className="muted small">QUESTION {questionIndex + 1} OF {selected.questions.length} · ELAPSED</span></div><div className="timer"><span>◷</span> {formatDuration(elapsedSeconds)}</div></div><div className="focus-notice">Elapsed time excludes pauses. Browser focus checks pause the test but cannot lock the device.</div><div className="progress-track"><span style={{ width: `${((questionIndex + 1) / selected.questions.length) * 100}%` }}/></div><div className="quiz-content"><div className="category-tag">{currentQuestion.category}</div><h1>{currentQuestion.question}</h1><div className="choices">{currentQuestion.choices.map((c, i) => <button key={i} className={`choice ${choice === i ? "selected" : ""}`} onClick={() => setChoice(i)}><span className="choice-letter">{String.fromCharCode(65 + i)}</span>{c}<span className="choice-check">{choice === i ? "✓" : ""}</span></button>)}</div><div className="quiz-controls"><button className="pause-button" onClick={() => pauseTest("The timer is stopped. Resume when you are ready to continue.")}>Ⅱ Pause</button><button className="button dark-button" onClick={advance} disabled={choice === null}>{questionIndex === selected.questions.length - 1 ? "Finish test" : "Next question"}<span>→</span></button></div></div>{paused && <div className="pause-overlay"><span className="pause-symbol">Ⅱ</span><div className="eyebrow">TEST PAUSED</div><h2>Test paused.</h2><p>{focusMessage}</p><button className="button dark-button" onClick={() => void resumeTest()}>Resume test <span>→</span></button></div>}</section>}
+    {screen === "quiz" && selected && currentQuestion && <section className="quiz-panel"><div className="quiz-top"><div><div className="eyebrow">{selected.name.toUpperCase()}</div><span className="muted small">QUESTION {questionIndex + 1} OF {selected.questions.length} · ELAPSED</span></div><div className="timer"><span>◷</span> {formatDuration(elapsedSeconds)}</div></div><div className="focus-notice">Elapsed time excludes pauses. Browser focus checks pause the test but cannot lock the device.</div><div className="progress-track"><span style={{ width: `${((questionIndex + 1) / selected.questions.length) * 100}%` }}/></div><div className="quiz-content"><div className="category-tag">{currentQuestion.category}</div><h1>{currentQuestion.question}</h1>{currentQuestion.diagramId && selectedDiagrams[currentQuestion.diagramId] && <img className="test-diagram" src={selectedDiagrams[currentQuestion.diagramId]} alt="Diagram for this question"/>}<div className="choices">{currentQuestion.choices.map((c, i) => { const diagramId = currentQuestion.choiceDiagramIds?.[i]; return <button key={i} className={`choice ${choice === i ? "selected" : ""}`} onClick={() => setChoice(i)}><span className="choice-letter">{String.fromCharCode(65 + i)}</span><span className="choice-content">{c}{diagramId && selectedDiagrams[diagramId] && <img className="choice-diagram" src={selectedDiagrams[diagramId]} alt={`Diagram for option ${String.fromCharCode(65 + i)}`}/>}</span><span className="choice-check">{choice === i ? "✓" : ""}</span></button>; })}</div><div className="quiz-controls"><button className="pause-button" onClick={() => pauseTest("The timer is stopped. Resume when you are ready to continue.")}>Ⅱ Pause</button><button className="button dark-button" onClick={advance} disabled={choice === null}>{questionIndex === selected.questions.length - 1 ? "Finish test" : "Next question"}<span>→</span></button></div></div>{paused && <div className="pause-overlay"><span className="pause-symbol">Ⅱ</span><div className="eyebrow">TEST PAUSED</div><h2>Test paused.</h2><p>{focusMessage}</p><button className="button dark-button" onClick={() => void resumeTest()}>Resume test <span>→</span></button></div>}</section>}
 
     {screen === "analytics" && result && <section className="panel wide-panel"><button className="back" onClick={() => { setScreen("attend"); setResult(null); }}>← Tests</button><div className="eyebrow">PRIVATE RESULT · {result.testName.toUpperCase()}</div><h1>Nice work,<br/><em>{result.participantName}.</em></h1><div className="score-card"><div><span className="muted small">YOUR SCORE</span><div className="score-number">{correctCount}<span> / {result.totalQuestions}</span></div><span className="muted small">ACTIVE TIME {formatDuration(result.durationSeconds)}</span></div><div className="score-ring" style={{ "--score": `${Math.round(100 * correctCount / result.totalQuestions)}%` } as React.CSSProperties}><span>{Math.round(100 * correctCount / result.totalQuestions)}<small>%</small></span></div></div><div className="stat-row"><div><strong>{correctCount}</strong><span>Correct</span></div><div><strong>{result.totalQuestions - correctCount}</strong><span>Incorrect</span></div><div><strong>{formatDuration(result.durationSeconds)}</strong><span>Active time</span></div></div><h2 className="section-title">By category</h2><div className="category-results">{Object.entries(result.answers.reduce<Record<string, { correct: number; total: number }>>((acc, answer) => { acc[answer.category] ??= { correct: 0, total: 0 }; acc[answer.category].total++; if (answer.correct) acc[answer.category].correct++; return acc; }, {})).map(([category, value]) => { const pct = Math.round(value.correct / value.total * 100); return <div className="category-result" key={category}><div><strong>{category}</strong><span>{value.correct} / {value.total}</span><b className={pct < 70 ? "weak" : ""}>{pct}% {pct < 70 ? "· revisit" : ""}</b></div><div className="result-track"><span className={pct < 70 ? "weak-fill" : ""} style={{ width: `${pct}%` }}/></div></div>; })}</div><h2 className="section-title">Question review</h2><div className="review-list">{result.answers.map((a, i) => <div className="review-item" key={a.questionId}><span className={a.correct ? "review-mark good" : "review-mark bad"}>{a.correct ? "✓" : "×"}</span><div><strong>Q{i + 1} · {a.correct ? "Correct" : "Review this one"} · {formatDuration(a.timeSpent)}</strong><small>{a.question}</small>{!a.correct && <small className="answer-note">Answer: {a.choices[a.correctAnswer]}</small>}</div></div>)}</div><button className="button dark-button" onClick={() => { setScreen("attend"); setResult(null); }}>Take another test <span>→</span></button></section>}
 
