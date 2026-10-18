@@ -1,10 +1,10 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, signOut, User } from "firebase/auth";
 import { addDoc, collection, doc, getDoc, getDocs, orderBy, query, serverTimestamp, writeBatch } from "firebase/firestore";
 import { db, firebaseAuth } from "@/lib/firebase";
-import type { AnswerRecord, Attempt, TestDefinition, TestQuestion, TestStats } from "@/lib/types";
+import type { AnswerRecord, Attempt, ImageCrop, TestDefinition, TestQuestion, TestStats } from "@/lib/types";
 
 type SavedTest = TestDefinition & { id: string };
 type Screen = "home" | "auth" | "create" | "preview" | "attend" | "quiz" | "analytics" | "testAnalytics";
@@ -16,6 +16,103 @@ const MAX_FILES = 3;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
 const MAX_STORED_DIAGRAM_BYTES = 600 * 1024;
+const MAX_TOTAL_STORED_DIAGRAM_BYTES = 6 * 1024 * 1024;
+
+function cropSourceImage(file: File, crop: ImageCrop): Promise<File> {
+  return new Promise((resolve, reject) => {
+    createImageBitmap(file).then(bitmap => {
+      try {
+        const sx = Math.max(0, Math.floor(crop.x * bitmap.width));
+        const sy = Math.max(0, Math.floor(crop.y * bitmap.height));
+        const sw = Math.min(bitmap.width - sx, Math.max(1, Math.round(crop.width * bitmap.width)));
+        const sh = Math.min(bitmap.height - sy, Math.max(1, Math.round(crop.height * bitmap.height)));
+        const canvas = document.createElement("canvas");
+        canvas.width = sw;
+        canvas.height = sh;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Your browser could not crop the selected diagram.");
+        context.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+        canvas.toBlob(blob => {
+          if (!blob) return reject(new Error("Could not crop the selected diagram."));
+          resolve(new File([blob], `cropped-${file.name.replace(/\.[^.]+$/, "")}.webp`, { type: "image/webp" }));
+        }, "image/webp", 0.94);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error("Could not crop the selected diagram."));
+      } finally {
+        bitmap.close();
+      }
+    }).catch(() => reject(new Error(`Could not read ${file.name} for cropping.`)));
+  });
+}
+
+function CropResultPreview({ file, crop, alt }: { file: File; crop: ImageCrop; alt: string }) {
+  const [preview, setPreview] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    createImageBitmap(file).then(bitmap => {
+      const sx = Math.max(0, Math.floor(crop.x * bitmap.width));
+      const sy = Math.max(0, Math.floor(crop.y * bitmap.height));
+      const sw = Math.min(bitmap.width - sx, Math.max(1, Math.round(crop.width * bitmap.width)));
+      const sh = Math.min(bitmap.height - sy, Math.max(1, Math.round(crop.height * bitmap.height)));
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      const context = canvas.getContext("2d");
+      if (context) {
+        context.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+        if (!cancelled) setPreview(canvas.toDataURL("image/webp", 0.82));
+      }
+      bitmap.close();
+    }).catch(() => setPreview(""));
+    return () => { cancelled = true; };
+  }, [file, crop]);
+  return preview ? <img className="diagram-preview" src={preview} alt={alt}/> : <p className="muted small">Preparing cropped preview…</p>;
+}
+
+function CropAreaSelector({ src, initialCrop, onCancel, onSave }: {
+  src: string;
+  initialCrop?: ImageCrop | null;
+  onCancel: () => void;
+  onSave: (crop: ImageCrop) => void;
+}) {
+  const [selection, setSelection] = useState<ImageCrop | undefined>(initialCrop ?? undefined);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const dragStart = useRef<{ x: number; y: number } | null>(null);
+  function point(event: ReactPointerEvent<HTMLDivElement>) {
+    const bounds = stageRef.current?.getBoundingClientRect();
+    if (!bounds || !bounds.width || !bounds.height) return { x: 0, y: 0 };
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+    };
+  }
+  function startCrop(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const start = point(event);
+    dragStart.current = start;
+    setSelection({ x: start.x, y: start.y, width: 0, height: 0 });
+  }
+  function moveCrop(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!dragStart.current) return;
+    const end = point(event);
+    const start = dragStart.current;
+    setSelection({ x: Math.min(start.x, end.x), y: Math.min(start.y, end.y), width: Math.abs(end.x - start.x), height: Math.abs(end.y - start.y) });
+  }
+  function endCrop() { dragStart.current = null; }
+  const usable = Boolean(selection && selection.width >= 0.02 && selection.height >= 0.02);
+  return <div className="crop-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onCancel(); }}>
+    <section className="crop-dialog" role="dialog" aria-modal="true" aria-labelledby="crop-title">
+      <div className="eyebrow">CROP QUESTION DIAGRAM</div><h2 id="crop-title">Select only the diagram</h2>
+      <p className="muted">Drag a box around the diagram or figure—not the whole question paper. Only this selected area will be saved with the test.</p>
+      <div className="crop-stage" ref={stageRef} onPointerDown={startCrop} onPointerMove={moveCrop} onPointerUp={endCrop} onPointerCancel={endCrop}>
+        <img className="crop-source" src={src} alt="Uploaded source image to crop" draggable={false}/>
+        {selection && <div className="crop-selection" style={{ left: `${selection.x * 100}%`, top: `${selection.y * 100}%`, width: `${selection.width * 100}%`, height: `${selection.height * 100}%` }}/>}
+      </div>
+      <div className="crop-actions"><button className="text-button" type="button" onClick={onCancel}>Cancel</button><button className="button dark-button" type="button" disabled={!usable} onClick={() => usable && selection && onSave(selection)}>Use selected crop <span>→</span></button></div>
+    </section>
+  </div>;
+}
 
 function resizeDiagram(file: File): Promise<{ dataUrl: string; contentType: string; byteSize: number }> {
   return new Promise((resolve, reject) => {
@@ -73,11 +170,15 @@ function validateTest(value: unknown): TestDefinition {
     const choiceImageIndexes = Array.isArray(q.choiceImageIndexes) && q.choiceImageIndexes.length === 4
       ? q.choiceImageIndexes.map(index => Number.isInteger(index) ? index : -1)
       : [-1, -1, -1, -1];
+    const questionImageCrop = normalizeImageCrop(q.questionImageCrop);
+    const choiceImageCrops = Array.isArray(q.choiceImageCrops) && q.choiceImageCrops.length === 4
+      ? q.choiceImageCrops.map(normalizeImageCrop)
+      : [undefined, undefined, undefined, undefined];
     return {
       id: q.id?.trim() || `q${index + 1}`,
       question: q.question.trim(), choices: q.choices.map(c => c.trim()), correctAnswer: q.correctAnswer as number,
       category: q.category.trim(), reviewNotes: Array.isArray(q.reviewNotes) ? q.reviewNotes.filter((n): n is string => typeof n === "string") : [],
-      questionImageIndex, choiceImageIndexes,
+      questionImageIndex, questionImageCrop, choiceImageIndexes, choiceImageCrops,
     };
   });
   return { name: test.name.trim(), description: typeof test.description === "string" ? test.description.trim() : "", questions };
@@ -86,6 +187,15 @@ function validateTest(value: unknown): TestDefinition {
 function formatDuration(seconds: number) {
   const safe = Math.max(0, Math.floor(seconds));
   return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function normalizeImageCrop(value: unknown): ImageCrop | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const crop = value as ImageCrop;
+  if (![crop.x, crop.y, crop.width, crop.height].every(Number.isFinite)
+      || crop.x < 0 || crop.y < 0 || crop.width <= 0 || crop.height <= 0
+      || crop.x + crop.width > 1 || crop.y + crop.height > 1) return undefined;
+  return { x: crop.x, y: crop.y, width: crop.width, height: crop.height };
 }
 
 export default function Home() {
@@ -104,6 +214,7 @@ export default function Home() {
   const [difficulty, setDifficulty] = useState("medium");
   const [sourceFiles, setSourceFiles] = useState<File[]>([]);
   const [sourcePreviewUrls, setSourcePreviewUrls] = useState<string[]>([]);
+  const [cropTarget, setCropTarget] = useState<{ questionIndex: number; choiceIndex?: number } | null>(null);
   const [selectedDiagrams, setSelectedDiagrams] = useState<Record<string, string>>({});
   const [generationPrompt, setGenerationPrompt] = useState("");
   const [generationBusy, setGenerationBusy] = useState(false);
@@ -201,8 +312,8 @@ export default function Home() {
     setBusy(true); clearError();
     try {
       const { id: _id, demo: _demo, ...data } = draft as TestDefinition & { id?: string; demo?: boolean };
-      const usedImageIndexes = new Set<number>();
-      for (const question of data.questions) {
+      const assignments: Array<{ id: string; imageIndex: number; crop: ImageCrop }> = [];
+      data.questions.forEach((question, questionIndex) => {
         const questionImageIndex = question.questionImageIndex ?? -1;
         const choiceImageIndexes = question.choiceImageIndexes ?? [-1, -1, -1, -1];
         if (questionImageIndex >= sourceFiles.length || questionImageIndex < -1
@@ -210,20 +321,32 @@ export default function Home() {
             || choiceImageIndexes.some(index => index < -1 || index >= sourceFiles.length)) {
           throw new Error("A question refers to an image that is no longer selected. Return to the creator and generate the draft again.");
         }
-        if (questionImageIndex >= 0) usedImageIndexes.add(questionImageIndex);
-        choiceImageIndexes.forEach(index => { if (index >= 0) usedImageIndexes.add(index); });
-      }
-      const diagramIds = [...usedImageIndexes].sort((a, b) => a - b).map(index => `diagram-${index}`);
-      const compressedDiagrams = await Promise.all([...usedImageIndexes].sort((a, b) => a - b).map(async index => ({
-        id: `diagram-${index}`,
-        ...await resizeDiagram(sourceFiles[index]),
+        if (questionImageIndex >= 0 && question.questionImageCrop) {
+          assignments.push({ id: `diagram-question-${questionIndex}`, imageIndex: questionImageIndex, crop: question.questionImageCrop });
+        }
+        const choiceImageCrops = question.choiceImageCrops || [];
+        choiceImageIndexes.forEach((imageIndex, choiceIndex) => {
+          if (imageIndex < 0) return;
+          const crop = choiceImageCrops[choiceIndex];
+          if (!crop) return;
+          assignments.push({ id: `diagram-choice-${questionIndex}-${choiceIndex}`, imageIndex, crop });
+        });
+      });
+      const compressedDiagrams = await Promise.all(assignments.map(async assignment => ({
+        id: assignment.id,
+        ...await resizeDiagram(await cropSourceImage(sourceFiles[assignment.imageIndex], assignment.crop)),
       })));
-      const questions = data.questions.map(question => {
-        const { questionImageIndex = -1, choiceImageIndexes = [-1, -1, -1, -1], ...textAndAnswer } = question;
+      const totalDiagramBytes = compressedDiagrams.reduce((total, diagram) => total + diagram.byteSize, 0);
+      if (totalDiagramBytes > MAX_TOTAL_STORED_DIAGRAM_BYTES) {
+        throw new Error("The selected diagram crops are too large to publish together. Remove some diagram links or use smaller crop areas (maximum 6 MB total). ");
+      }
+      const diagramIds = compressedDiagrams.map(diagram => diagram.id);
+      const questions = data.questions.map((question, questionIndex) => {
+        const { questionImageIndex = -1, choiceImageIndexes = [-1, -1, -1, -1], questionImageCrop: _questionCrop, choiceImageCrops: _choiceCrops, ...textAndAnswer } = question;
         return {
           ...textAndAnswer,
-          ...(questionImageIndex >= 0 ? { diagramId: `diagram-${questionImageIndex}` } : {}),
-          choiceDiagramIds: choiceImageIndexes.map(index => index >= 0 ? `diagram-${index}` : null),
+          ...(questionImageIndex >= 0 && question.questionImageCrop ? { diagramId: `diagram-question-${questionIndex}` } : {}),
+          choiceDiagramIds: choiceImageIndexes.map((imageIndex, choiceIndex) => imageIndex >= 0 && question.choiceImageCrops?.[choiceIndex] ? `diagram-choice-${questionIndex}-${choiceIndex}` : null),
         };
       });
       const testRef = doc(collection(db, "tests"));
@@ -331,15 +454,45 @@ export default function Home() {
     setDraft({ ...draft, questions: draft.questions.map((question, i) => i === index ? { ...question, ...update } : question) });
   }
   function setQuestionImage(index: number, imageIndex: number) {
-    updateQuestion(index, { questionImageIndex: imageIndex });
+    const current = draft?.questions[index];
+    updateQuestion(index, {
+      questionImageIndex: imageIndex,
+      ...(current?.questionImageIndex !== imageIndex ? { questionImageCrop: undefined } : {}),
+    });
   }
   function setChoiceImage(questionIndex: number, choiceIndex: number, imageIndex: number) {
     const question = draft?.questions[questionIndex];
     if (!question) return;
     const choiceImageIndexes = [...(question.choiceImageIndexes || [-1, -1, -1, -1])];
+    const choiceImageCrops = [...(question.choiceImageCrops || [undefined, undefined, undefined, undefined])];
+    if (choiceImageIndexes[choiceIndex] !== imageIndex) choiceImageCrops[choiceIndex] = undefined;
     choiceImageIndexes[choiceIndex] = imageIndex;
-    updateQuestion(questionIndex, { choiceImageIndexes });
+    updateQuestion(questionIndex, { choiceImageIndexes, choiceImageCrops });
   }
+  function saveCropArea(crop: ImageCrop) {
+    if (!draft || !cropTarget) return;
+    const question = draft.questions[cropTarget.questionIndex];
+    if (!question) return;
+    if (cropTarget.choiceIndex === undefined) {
+      updateQuestion(cropTarget.questionIndex, { questionImageCrop: crop });
+    } else {
+      const choiceImageCrops = [...(question.choiceImageCrops || [undefined, undefined, undefined, undefined])];
+      choiceImageCrops[cropTarget.choiceIndex] = crop;
+      updateQuestion(cropTarget.questionIndex, { choiceImageCrops });
+    }
+    setCropTarget(null);
+  }
+  const cropQuestion = cropTarget ? draft?.questions[cropTarget.questionIndex] : undefined;
+  const cropSourceIndex = cropTarget && cropQuestion
+    ? cropTarget.choiceIndex === undefined
+      ? cropQuestion.questionImageIndex ?? -1
+      : cropQuestion.choiceImageIndexes?.[cropTarget.choiceIndex] ?? -1
+    : -1;
+  const activeCrop = cropTarget && cropQuestion
+    ? cropTarget.choiceIndex === undefined
+      ? cropQuestion.questionImageCrop
+      : cropQuestion.choiceImageCrops?.[cropTarget.choiceIndex]
+    : undefined;
 
   return <main className="app-shell">
     <header className="topbar"><button className="brand" disabled={screen === "quiz"} onClick={() => { setScreen("home"); clearError(); }} aria-label="Go home"><span className="brand-mark">m</span>minute</button><span className="top-note">A little practice, one question at a time.</span>{authReady && user && <button className="text-button" onClick={() => firebaseAuth && void signOut(firebaseAuth)}>Sign out</button>}</header>
@@ -371,18 +524,18 @@ export default function Home() {
       <p className="muted">Edit the title, questions, options, answer key, and diagram links. Nothing is published until you approve it below.</p>
       <label className="edit-field">Test title<input value={draft.name} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, name: e.target.value }); }}/></label>
       <label className="edit-field">Description<input value={draft.description} onChange={e => { setReviewConfirmed(false); setDraft({ ...draft, description: e.target.value }); }}/></label>
-      <div className="diagram-source-note">Select a source image for the question or any answer choice. Only images linked to a question are saved, compressed, in Firestore.</div>
+      <div className="diagram-source-note">The AI tries to isolate each relevant figure automatically. Check the cropped previews below; you can adjust a crop if needed. Full question-paper pages are never attached to a published test.</div>
       <div className="question-list">{draft.questions.map((q, i) => <article className="question-preview" key={q.id}>
         <div className="question-meta"><span>QUESTION {String(i + 1).padStart(2, "0")}</span><button className="text-button" onClick={() => { setReviewConfirmed(false); setDraft({ ...draft, questions: draft.questions.filter((_, idx) => idx !== i) }); }}>Remove</button></div>
         {q.reviewNotes?.length ? <div className="review-warning"><strong>Needs source check</strong><ul>{q.reviewNotes.map((note, ni) => <li key={ni}>{note}</li>)}</ul></div> : null}
         <label className="edit-field">Question<input value={q.question} onChange={e => updateQuestion(i, { question: e.target.value })}/></label>
-        <div className="diagram-association"><label>Question diagram<select value={q.questionImageIndex ?? -1} onChange={e => setQuestionImage(i, Number(e.target.value))}><option value={-1}>No diagram</option>{sourceFiles.map((file, imageIndex) => <option key={imageIndex} value={imageIndex}>{`Image ${imageIndex + 1}: ${file.name}`}</option>)}</select></label>{(q.questionImageIndex ?? -1) >= 0 && sourcePreviewUrls[q.questionImageIndex!] && <img className="diagram-preview" src={sourcePreviewUrls[q.questionImageIndex!]} alt={`Question ${i + 1} diagram preview`}/>}</div>
-        <div className="choice-edit-list">{q.choices.map((c, ci) => { const imageIndex = q.choiceImageIndexes?.[ci] ?? -1; return <div className="choice-edit" key={ci}>
+        <div className="diagram-association"><label>Question diagram<select value={q.questionImageIndex ?? -1} onChange={e => setQuestionImage(i, Number(e.target.value))}><option value={-1}>No diagram</option>{sourceFiles.map((file, imageIndex) => <option key={imageIndex} value={imageIndex}>{`Image ${imageIndex + 1}: ${file.name}`}</option>)}</select></label>{(q.questionImageIndex ?? -1) >= 0 && <>{q.questionImageCrop ? <CropResultPreview file={sourceFiles[q.questionImageIndex!]} crop={q.questionImageCrop} alt={`Cropped diagram for question ${i + 1}`}/> : <p className="crop-missing-note">No figure crop was detected, so no image will be attached. You can crop it manually if needed.</p>}<button className="crop-button" type="button" onClick={() => setCropTarget({ questionIndex: i })}>{q.questionImageCrop ? "Adjust crop (optional)" : "Crop manually (optional)"}</button></>}</div>
+        <div className="choice-edit-list">{q.choices.map((c, ci) => { const imageIndex = q.choiceImageIndexes?.[ci] ?? -1; const imageCrop = q.choiceImageCrops?.[ci]; return <div className="choice-edit" key={ci}>
           <input type="radio" name={`correct-${i}`} checked={q.correctAnswer === ci} aria-label={`Mark choice ${ci + 1} correct`} onChange={() => updateQuestion(i, { correctAnswer: ci })}/>
           <input value={c} aria-label={`Choice ${ci + 1}`} onChange={e => updateQuestion(i, { choices: q.choices.map((option, oi) => oi === ci ? e.target.value : option) })}/>
           <span>Correct</span>
           <select aria-label={`Diagram for choice ${ci + 1}`} value={imageIndex} onChange={e => setChoiceImage(i, ci, Number(e.target.value))}><option value={-1}>No choice diagram</option>{sourceFiles.map((file, sourceIndex) => <option key={sourceIndex} value={sourceIndex}>{`Image ${sourceIndex + 1}: ${file.name}`}</option>)}</select>
-          {imageIndex >= 0 && sourcePreviewUrls[imageIndex] && <img className="diagram-preview choice-diagram-preview" src={sourcePreviewUrls[imageIndex]} alt={`Choice ${ci + 1} diagram preview`}/>}
+          {imageIndex >= 0 && <>{imageCrop ? <div className="choice-diagram-preview"><CropResultPreview file={sourceFiles[imageIndex]} crop={imageCrop} alt={`Cropped diagram for choice ${String.fromCharCode(65 + ci)}`}/></div> : <p className="crop-missing-note choice-diagram-preview">No figure crop was detected; this image will not be attached.</p>}<button className="crop-button choice-diagram-preview" type="button" onClick={() => setCropTarget({ questionIndex: i, choiceIndex: ci })}>{imageCrop ? "Adjust crop (optional)" : "Crop manually (optional)"}</button></>}
         </div>; })}</div>
         <div className="edit-grid"><label>Category<input value={q.category} onChange={e => updateQuestion(i, { category: e.target.value })}/></label></div>
       </article>)}</div>
@@ -400,5 +553,6 @@ export default function Home() {
     {screen === "testAnalytics" && selected && <section className="panel wide-panel"><button className="back" onClick={() => setScreen("attend")}>← Tests</button><div className="eyebrow">ANONYMOUS TEST ANALYTICS</div><h1>{selected.name}</h1><p className="muted">Only aggregate timing and attempt counts are shown here. Individual answers are private.</p>{statsLoading ? <p className="muted">Loading aggregate statistics…</p> : selectedStats ? <><div className="stat-row"><div><strong>{selectedStats.attemptCount}</strong><span>Attempts</span></div><div><strong>{formatDuration(selectedStats.totalDurationSeconds / selectedStats.attemptCount)}</strong><span>Average active test time</span></div><div><strong>{selected.questions.length}</strong><span>Questions</span></div></div><h2 className="section-title">Average time by question</h2><div className="category-results">{selected.questions.map((question, index) => { const metric = selectedStats.questions?.[question.id]; return <div className="category-result question-stat" key={question.id}><div><strong>Q{index + 1} · {question.question}</strong><span>{metric?.count || 0} attempts</span><b>{metric?.count ? formatDuration(metric.totalTimeSeconds / metric.count) : "—"}</b></div><div className="result-track"><span style={{ width: `${metric?.count ? Math.min(100, metric.totalTimeSeconds / metric.count / 60 * 100) : 0}%` }}/></div></div>; })}</div></> : <div className="setup-note">No aggregate results yet. Complete attempts will appear here after the Firebase aggregate function has been deployed. Individual results are never listed on this page.</div>}</section>}
 
     <footer><span>minute<span className="footer-dot">.</span></span><span>SMALL STEPS. SHARP MINDS.</span></footer>
+    {cropTarget && sourcePreviewUrls[cropSourceIndex] && <CropAreaSelector src={sourcePreviewUrls[cropSourceIndex]} initialCrop={activeCrop} onCancel={() => setCropTarget(null)} onSave={saveCropArea}/>}
   </main>;
 }

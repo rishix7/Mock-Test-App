@@ -9,12 +9,18 @@ export type TestQuestion = {
   reviewNotes?: string[];
   /** 0-based source-image index while a draft is being reviewed. */
   questionImageIndex?: number;
+  /** Normalized selection to crop from the source image before publishing. */
+  questionImageCrop?: ImageCrop;
   /** One 0-based source-image index per choice; -1 means no diagram. */
   choiceImageIndexes?: number[];
+  /** Normalized crop area for each choice's selected source image. */
+  choiceImageCrops?: Array<ImageCrop | null | undefined>;
   /** Firestore subcollection document IDs after the test is published. */
   diagramId?: string;
   choiceDiagramIds?: Array<string | null>;
 };
+
+export type ImageCrop = { x: number; y: number; width: number; height: number };
 
 export type TestDefinition = {
   name: string;
