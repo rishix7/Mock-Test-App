@@ -1,0 +1,8 @@
+{
+  "name": "mocktest-image-generation-api",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  }
+}
